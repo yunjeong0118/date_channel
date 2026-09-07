@@ -5,18 +5,20 @@
 =========================================================
 
 Streamlit Community Cloud에 배포하면, 팀원은 exe/Excel 설치 없이
-브라우저에서 링크만 열어 파일을 업로드하고 PDF를 내려받을 수 있습니다.
+브라우저에서 링크만 열어 파일을 업로드하고 PDF/JPG를 내려받을 수 있습니다.
 
-PDF 변환은 LibreOffice(soffice)를 사용합니다 (Windows Excel 불필요).
-Streamlit Cloud에서 LibreOffice를 쓰려면 이 저장소에 packages.txt 로
-`libreoffice`, `fonts-nanum` 을 apt 패키지로 지정해둬야 합니다
-(같이 준비해뒀습니다).
+PDF 변환은 LibreOffice(soffice)를, PDF→JPG 변환은 poppler(pdftoppm)를
+사용합니다 (Windows Excel 불필요). Streamlit Cloud에서 쓰려면 이 저장소에
+packages.txt 로 `libreoffice`, `fonts-nanum`, `poppler-utils` 를 apt
+패키지로 지정해둬야 합니다 (같이 준비해뒀습니다).
 """
 
+import io
 import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from copy import copy
 from datetime import datetime
 from pathlib import Path
@@ -224,6 +226,28 @@ def convert_to_pdf(xlsx_path: Path, outdir: Path) -> Path:
     return outdir / (xlsx_path.stem + ".pdf")
 
 
+def convert_pdf_to_jpgs(pdf_path: Path, outdir: Path, base_name: str):
+    """PDF의 각 페이지를 JPG로 변환해 [(파일명, bytes), ...] 로 반환한다."""
+    pdftoppm_bin = shutil.which("pdftoppm")
+    if not pdftoppm_bin:
+        raise RuntimeError(
+            "이 서버에 poppler(pdftoppm)가 설치되어 있지 않아요. "
+            "저장소의 packages.txt에 'poppler-utils' 항목이 있는지 확인해주세요."
+        )
+    prefix = outdir / base_name
+    result = subprocess.run(
+        [pdftoppm_bin, "-jpeg", "-r", "150", str(pdf_path), str(prefix)],
+        capture_output=True, text=True, timeout=120,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"JPG 변환 실패: {result.stderr}")
+    jpg_files = sorted(outdir.glob(f"{base_name}-*.jpg")) or sorted(outdir.glob(f"{base_name}*.jpg"))
+    if len(jpg_files) == 1:
+        # 1페이지짜리는 페이지 번호 없이 깔끔한 이름으로
+        return [(f"{base_name}.jpg", jpg_files[0].read_bytes())]
+    return [(f.name, f.read_bytes()) for f in jpg_files]
+
+
 def make_single_sheet_workbook(src_ws, sheet_name) -> openpyxl.Workbook:
     wb_single = openpyxl.Workbook()
     wb_single.remove(wb_single.active)
@@ -326,29 +350,63 @@ if run:
                 wb_out.save(combined_path)
 
                 pdf_results = []
+                jpg_results = []
                 for sheet_name, target_date in day_sheets:
                     single_wb = make_single_sheet_workbook(wb_out[sheet_name], sheet_name)
                     single_path = tmpdir / f"_print_{sheet_name}.xlsx"
                     single_wb.save(single_path)
                     pdf_path = convert_to_pdf(single_path, tmpdir)
-                    final_name = f"{target_date.strftime('%y%m%d')}({WEEKDAY_KR[target_date.weekday()]})_{label}.pdf"
-                    pdf_results.append((final_name, pdf_path.read_bytes()))
+
+                    base_label = f"{target_date.strftime('%y%m%d')}({WEEKDAY_KR[target_date.weekday()]})_{label}"
+                    final_pdf_name = f"{base_label}.pdf"
+                    pdf_results.append((final_pdf_name, pdf_path.read_bytes()))
+
+                    for jpg_name, jpg_bytes in convert_pdf_to_jpgs(pdf_path, tmpdir, base_label):
+                        jpg_results.append((jpg_name, jpg_bytes))
+
+                # ---- 전체를 zip 하나로 묶기 ----
+                zip_buf = io.BytesIO()
+                with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    zf.writestr(combined_path.name, combined_path.read_bytes())
+                    for fname, data in pdf_results:
+                        zf.writestr(f"pdf/{fname}", data)
+                    for fname, data in jpg_results:
+                        zf.writestr(f"jpg/{fname}", data)
+                zip_buf.seek(0)
 
                 st.success("완료!")
                 st.download_button(
-                    "📊 합본 xlsx 다운로드",
-                    data=combined_path.read_bytes(),
-                    file_name=combined_path.name,
+                    "📦 전체 한 번에 다운로드 (zip: 합본 xlsx + PDF + JPG)",
+                    data=zip_buf.getvalue(),
+                    file_name=f"{label}.zip",
+                    mime="application/zip",
+                    type="primary",
                     use_container_width=True,
                 )
-                for fname, data in pdf_results:
+
+                with st.expander("파일 하나씩 따로 받기"):
                     st.download_button(
-                        f"📄 {fname} 다운로드",
-                        data=data,
-                        file_name=fname,
-                        mime="application/pdf",
+                        "📊 합본 xlsx",
+                        data=combined_path.read_bytes(),
+                        file_name=combined_path.name,
                         use_container_width=True,
                     )
+                    for fname, data in pdf_results:
+                        st.download_button(
+                            f"📄 {fname}",
+                            data=data,
+                            file_name=fname,
+                            mime="application/pdf",
+                            use_container_width=True,
+                        )
+                    for fname, data in jpg_results:
+                        st.download_button(
+                            f"🖼️ {fname}",
+                            data=data,
+                            file_name=fname,
+                            mime="image/jpeg",
+                            use_container_width=True,
+                        )
             except Exception as e:
                 st.error(f"오류가 발생했어요: {e}")
                 raise
